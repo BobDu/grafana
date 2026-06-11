@@ -2,8 +2,9 @@
 #
 # Triggered by tags matching team-sync-v* (e.g. team-sync-v13.0.2-1).
 # Uses the official root Dockerfile unchanged. Deliberately avoids
-# third-party actions (only github-owned actions/checkout) so it runs
-# under any repository Actions policy; layer cache lives in the registry
+# any marketplace/github actions at all (checkout is plain git) so it
+# runs even under the strictest Actions policy (owner-only) — which also
+# keeps upstream workflows permanently startup-failed at zero cost; layer cache lives in the registry
 # (ghcr buildcache tag) — rebuilds are cheap since this fork never
 # touches the frontend.
 name: team-sync-build
@@ -28,7 +29,8 @@ jobs:
           sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc /opt/hostedtoolcache/CodeQL
           df -h /
 
-      - uses: actions/checkout@v4
+      - name: Checkout (no actions needed)
+        run: git clone --depth 1 --branch "${GITHUB_REF_NAME}" "https://github.com/${GITHUB_REPOSITORY}.git" .
 
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
