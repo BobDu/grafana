@@ -47,6 +47,7 @@ func (oss *OSSMigrations) AddMigration(mg *Migrator) {
 	addTestDataMigrations(mg)
 	addDashboardVersionMigration(mg)
 	addTeamMigrations(mg)
+	addTeamSyncMigrations(mg) // fork(team-sync)
 	addDashboardACLMigrations(mg) // Do NOT add more migrations to this function.
 	addTagMigration(mg)
 	addLoginAttemptMigrations(mg)
