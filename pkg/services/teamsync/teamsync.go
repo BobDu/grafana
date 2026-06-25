@@ -24,7 +24,9 @@ package teamsync
 import (
 	"context"
 	"errors"
+	"path"
 	"strconv"
+	"strings"
 
 	claims "github.com/grafana/authlib/types"
 
@@ -35,6 +37,7 @@ import (
 	"github.com/grafana/grafana/pkg/services/accesscontrol"
 	"github.com/grafana/grafana/pkg/services/authn"
 	"github.com/grafana/grafana/pkg/services/team"
+	"github.com/grafana/grafana/pkg/setting"
 )
 
 // HookPriority places the team sync hook between org role sync (40) and
@@ -61,6 +64,12 @@ type Service struct {
 	teamPerm accesscontrol.TeamPermissionsService
 	log      log.Logger
 	tracer   tracing.Tracer
+
+	// Lazy team auto-creation at login. Off unless [team_sync]
+	// auto_create_enabled=true. autoCreateFilters is a glob allow-list
+	// (path.Match) over group emails; empty + enabled = all groups.
+	autoCreateEnabled bool
+	autoCreateFilters []string
 }
 
 func ProvideService(
@@ -70,16 +79,51 @@ func ProvideService(
 	routeRegister routing.RouteRegister,
 	accessControl accesscontrol.AccessControl,
 	tracer tracing.Tracer,
+	cfg *setting.Cfg,
 ) *Service {
+	logger := log.New("teamsync")
+	enabled, filters := parseAutoCreateConfig(cfg, logger)
 	s := &Service{
-		db:       sqlStore,
-		teamSvc:  teamService,
-		teamPerm: teamPermissionsService,
-		log:      log.New("teamsync"),
-		tracer:   tracer,
+		db:                sqlStore,
+		teamSvc:           teamService,
+		teamPerm:          teamPermissionsService,
+		log:               logger,
+		tracer:            tracer,
+		autoCreateEnabled: enabled,
+		autoCreateFilters: filters,
 	}
 	s.registerRoutes(routeRegister, accessControl)
+	if enabled {
+		logger.Info("Team auto-create enabled", "filters", filters)
+	}
 	return s
+}
+
+// parseAutoCreateConfig reads [team_sync] auto_create_enabled (bool) and
+// auto_create_group_filters (comma-separated glob list; env overrides
+// GF_TEAM_SYNC_AUTO_CREATE_ENABLED / _GROUP_FILTERS). Invalid globs are
+// dropped with a warning so a typo can't silently match nothing forever.
+func parseAutoCreateConfig(cfg *setting.Cfg, logger log.Logger) (bool, []string) {
+	if cfg == nil {
+		return false, nil
+	}
+	sec := cfg.SectionWithEnvOverrides("team_sync")
+	enabled := sec.Key("auto_create_enabled").MustBool(false)
+	raw := sec.Key("auto_create_group_filters").MustString("")
+
+	var filters []string
+	for _, p := range strings.Split(raw, ",") {
+		p = strings.TrimSpace(p)
+		if p == "" {
+			continue
+		}
+		if _, err := path.Match(p, ""); err != nil {
+			logger.Warn("Ignoring invalid team auto-create glob pattern", "pattern", p, "error", err)
+			continue
+		}
+		filters = append(filters, p)
+	}
+	return enabled, filters
 }
 
 // SyncTeamsHook is registered as an authn post-auth hook. It only acts on
@@ -104,6 +148,12 @@ func (s *Service) SyncTeamsHook(ctx context.Context, id *authn.Identity, _ *auth
 
 	orgID := id.GetOrgID()
 	logger := s.log.FromContext(ctx)
+
+	// Lazily provision teams for filter-matching idP groups that have no
+	// mapping yet, so the first login of a new group's member creates the
+	// team + team_group binding. Strictly best-effort: any failure is logged
+	// and never returned, so it can never block login (the contract of this hook).
+	s.ensureAutoCreatedTeams(ctx, orgID, id.Groups, logger)
 
 	desired, err := s.GetTeamIDsForGroups(ctx, orgID, id.Groups)
 	if err != nil {
@@ -169,6 +219,101 @@ func (s *Service) GetTeamIDsForGroups(ctx context.Context, orgID int64, groups [
 			Find(&teamIDs)
 	})
 	return teamIDs, err
+}
+
+// ensureAutoCreatedTeams lazily creates teams + team_group bindings for the
+// user's idP groups that match the configured glob allow-list. Best-effort:
+// every failure is logged and swallowed so it can never block login.
+func (s *Service) ensureAutoCreatedTeams(ctx context.Context, orgID int64, groups []string, logger log.Logger) {
+	if !s.autoCreateEnabled || len(groups) == 0 {
+		return
+	}
+	for _, g := range groups {
+		if !s.matchesAutoCreate(g) {
+			continue
+		}
+		if err := s.ensureTeamForGroup(ctx, orgID, g); err != nil {
+			logger.Warn("Team auto-create from group failed; skipping (login not blocked)", "group", g, "error", err)
+		}
+	}
+}
+
+// matchesAutoCreate reports whether a group is in scope for auto-creation.
+// No filters configured means "all groups" (the caller has already checked
+// that auto-create is enabled). Glob syntax is stdlib path.Match (*, ?, []).
+func (s *Service) matchesAutoCreate(group string) bool {
+	if len(s.autoCreateFilters) == 0 {
+		return true
+	}
+	for _, f := range s.autoCreateFilters {
+		if ok, err := path.Match(f, group); err == nil && ok {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureTeamForGroup idempotently guarantees a team exists for the group and is
+// bound via team_group. Mirrors the one-shot sync's find-or-create and tolerates
+// concurrent first-logins of the same new group (lost create race → re-resolve).
+func (s *Service) ensureTeamForGroup(ctx context.Context, orgID int64, group string) error {
+	// Fast path: already mapped → nothing to do.
+	if mapped, err := s.GetTeamIDsForGroups(ctx, orgID, []string{group}); err == nil && len(mapped) > 0 {
+		return nil
+	}
+
+	name := teamNameFromGroup(group)
+
+	// The team may already exist (created out-of-band) but be unbound.
+	teamID, err := s.findTeamIDByName(ctx, orgID, name)
+	if err != nil {
+		return err
+	}
+	if teamID == 0 {
+		created, cErr := s.teamSvc.CreateTeam(ctx, &team.CreateTeamCommand{Name: name, Email: group, OrgID: orgID})
+		if cErr == nil {
+			teamID = created.ID
+		} else {
+			// Lost a create race, or an untranslated unique-key conflict: re-resolve by name.
+			id, fErr := s.findTeamIDByName(ctx, orgID, name)
+			if fErr != nil {
+				return fErr
+			}
+			if id == 0 {
+				return cErr
+			}
+			teamID = id
+		}
+	}
+
+	if err := s.AddTeamGroup(ctx, orgID, teamID, group); err != nil && !errors.Is(err, ErrTeamGroupAlreadyAdded) {
+		return err
+	}
+	return nil
+}
+
+// findTeamIDByName returns the team id for an exact (org, name) match, or 0 if none.
+func (s *Service) findTeamIDByName(ctx context.Context, orgID int64, name string) (int64, error) {
+	var t team.Team
+	var found bool
+	err := s.db.WithDbSession(ctx, func(sess *db.Session) error {
+		ok, e := sess.Table("team").Where("org_id = ? AND name = ?", orgID, name).Get(&t)
+		found = ok
+		return e
+	})
+	if err != nil || !found {
+		return 0, err
+	}
+	return t.ID, nil
+}
+
+// teamNameFromGroup derives the team name from a group email's local part
+// ("screw_3d2.data.monetization@dragonplus.com" → "screw_3d2.data.monetization").
+func teamNameFromGroup(group string) string {
+	if i := strings.IndexByte(group, '@'); i > 0 {
+		return group[:i]
+	}
+	return group
 }
 
 // ListGroupsForTeam returns the external groups mapped to a team.
